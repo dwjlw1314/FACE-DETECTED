@@ -3,9 +3,10 @@
 #include "RetinaFace.h"
 #include "featurextract.h"
 
-//2.0.0.0 use #define value
-#define VERSION "2.0.0.0"
+//2.0.1.2 use #define value
+#define VERSION "2.0.1.2"
 
+#define USED_TRACKER 0
 #define USED_WARPAFFINEI 1
 #define USED_BGRToRGB 0
 #define USED_RETINAFACE 1
@@ -15,6 +16,9 @@ using namespace cv;
 
 int g_DeviceId;
 DeviceType g_DeviceType;
+bool g_EnableRelease = false;
+//sync_mutex
+pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void g_SetContext(int id = 0, DeviceType type = mxnet::cpp::kCPU)
 {
@@ -31,17 +35,28 @@ Context g_GetContext()
     return Context::cpu(g_DeviceId);
 }
 
+MtcnnPar default_par{0, 40, 0.509,	{112,112}, {0.6,0.8,0.9},
+	{0.5,0.7,0.7}, 1920, FACTOR_16_9, (char*)"fc1_output"};
+
 GsFaceDetectSDK::GsFaceDetectSDK(const char* path, MtcnnPar *param, bool useGpu)
 	: m_mtcnn(nullptr), m_retinaFace(nullptr), m_feaExt(nullptr)
 {
 	//init default par member
-	MtcnnPar default_par {0, 40, 0.509,
-					{112,112},
-					{0.6,0.8,0.9},
-					{0.5,0.7,0.7},
-					"fc1_output"};
 	if (!param)
 		param = &default_par;
+
+	m_pictureWSize = param->LongSideSize;
+	switch(param->scalRatio)
+	{
+		case FACTOR_8_16:
+			m_pictureHSize = m_pictureWSize*2; break;
+		case FACTOR_4_3:
+			m_pictureHSize = m_pictureWSize*3/4; break;
+		case FACTOR_16_9:
+			m_pictureHSize = m_pictureWSize*9/16; break;
+		case FACTOR_16_10:
+			m_pictureHSize = m_pictureWSize*10/16; break;
+	}
 
 	if (useGpu)
 		g_SetContext(param->devid, mxnet::cpp::kGPU);
@@ -50,12 +65,25 @@ GsFaceDetectSDK::GsFaceDetectSDK(const char* path, MtcnnPar *param, bool useGpu)
 
 	m_OutWidth = param->featureshape[0];
 	m_OutHeight = param->featureshape[1];
+
+	pthread_mutex_lock(&g_mutex);
+
+	try {
 #if USED_RETINAFACE
-	m_retinaFace = new RetinaFace(path, param, useGpu);
+		m_retinaFace = new RetinaFace(path, param, useGpu);
 #elif USED_MTCNN
-    m_mtcnn = new MTCNN(path, param, useGpu);
+		m_mtcnn = new MTCNN(path, param, useGpu);
 #endif
-    m_feaExt = new FeaturExtract(path, param);
+		m_feaExt = new FeaturExtract(path, param);
+		m_InitStatus = true;
+	}
+	catch(/*dmlc::Error &err*/...)
+	{
+		m_InitStatus = false;
+	}
+
+    //前期调试使用，后期发布可以使用自解锁模式
+	pthread_mutex_unlock(&g_mutex);
 }
 
 void GsFaceDetectSDK::warpAffineI(cv::Mat& image, FaceRect& faceRect, std::vector<cv::Mat>& featureMat)
@@ -113,27 +141,66 @@ cv::Mat GsFaceDetectSDK::BGRToRGB(cv::Mat& img)
 }
 #endif
 
+float GsFaceDetectSDK::normalization(cv::Mat& src)
+{
+	Mat temImage;
+    Mat imageROI;
+    float scalfactor = 1.;
+
+	int w = src.cols;
+	int h = src.rows;
+
+	Scalar color = Scalar(0,0,0);
+
+	if (w > m_pictureWSize || h > m_pictureHSize)
+	{
+		int wf = w-m_pictureWSize;
+		int hf = h-m_pictureHSize;
+		if (wf > hf)
+			scalfactor = float(m_pictureWSize)/(float)w;
+		else
+			scalfactor = float(m_pictureHSize)/(float)h;
+		resize(src,src,Size(w*scalfactor, h*scalfactor), 0, 0, cv::INTER_LINEAR);
+	}
+    copyMakeBorder(src, src, 0, m_pictureHSize-src.rows, 0, m_pictureWSize-src.cols, BORDER_CONSTANT, color);
+
+    /* 网络摄像头使用
+	int kernel_size = 3; //滤波器的核
+	Mat kern = Mat::ones(kernel_size,kernel_size,CV_32F)/(float)(kernel_size*kernel_size);
+
+	//由于原视频是网络摄像头采集的，所以有很多雪花点，在这里进行了简单的均值滤波处理
+	filter2D(src,src,-1,kern);
+    */
+
+    return scalfactor;
+}
+
 /*
  * 通过最后一个参数指定类型，获取不同的数据
  */
 FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, int height,
-		int channel, pFaceRect facePoints, GetFaceType type)
+		int channel, pFaceRect facePoints, bool dynamic_scale, GetFaceType type)
 {
+	while (g_EnableRelease)
+		usleep(1000);
+
+	float scalfactor = 1.;
     FACE_NUMBERS ret = 0;
     std::vector<FaceRect> faceInfo;
     std::vector<cv::Mat> FeatureMat;
     cv::Mat image(height, width, CV_8UC3);
 
-    if(nullptr == data)
+    if(!m_InitStatus || nullptr == data || nullptr == facePoints)
     	return ret;
+
     //Mat img_rgb;
     for(int i = 0; i < height; i++)
     {
         for (int j = 0; j < width; j++)
         {
-            image.at<cv::Vec3b>(i,j)[0] = data[width * channel * i + j * channel + 0];
-            image.at<cv::Vec3b>(i,j)[1] = data[width * channel * i + j * channel + 1];
-            image.at<cv::Vec3b>(i,j)[2] = data[width * channel * i + j * channel + 2];
+        	image.at<cv::Vec3b>(i,j)[0] = data[width * channel * i + j * channel + 0];
+        	image.at<cv::Vec3b>(i,j)[1] = data[width * channel * i + j * channel + 1];
+        	image.at<cv::Vec3b>(i,j)[2] = data[width * channel * i + j * channel + 2];
         }
     }
 
@@ -143,21 +210,40 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 
     if (GetFaceType::FACEBOX & type)
     {
+    	if (dynamic_scale)
+    	{
+    		scalfactor = normalization(image);
+    	}
+    	try {
 #if USED_RETINAFACE
-    	m_retinaFace->Detect(image, faceInfo);
+    		//vector<FaceRect>().swap(faceInfo);
+    		m_retinaFace->Detect(image, faceInfo);
 #elif USED_MTCNN
-		m_mtcnn->Detect(image, faceInfo);
+    		m_mtcnn->Detect(image, faceInfo);
 #endif
+		}
+		catch(/*dmlc::Error &err*/...)
+		{
+			ret = 0;
+			faceInfo.clear();
+			//是否重新抛出dmlc::Error异常到上层函数,根据业务需求定
+		}
 		for(auto face : faceInfo)
 		{
 			facePoints[ret++] = face;
 		}
+
+		if(0 == ret) return ret;
     }
 
-	if(0 == ret) return ret;
-
-	if (GetFaceType::FACEFEATURE & type)
+    if (GetFaceType::FACEFEATURE & type)
 	{
+		size_t i = 0;
+		if(0 == ret)
+		{
+			while(facePoints[i++].score > 0.6)
+				ret++;
+		}
 		/*
 		 * 截取原图的指定位置大小的区域  dst_img = src_img(Range(0,100),Range(50,200));
 		 * 这里截取的就是原图第0行至第99行,第50列至199列的区域图像.这里要注意的就是Range的两个参数范围分别为左包含和右不包含
@@ -166,8 +252,8 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 		{
 			facePoints[i].y1 = facePoints[i].y1 <= 0 ? 0 : facePoints[i].y1;
 			facePoints[i].x1 = facePoints[i].x1 <= 0 ? 0 : facePoints[i].x1;
-			facePoints[i].y2 = facePoints[i].y2 >= height ? height : facePoints[i].y2;
-			facePoints[i].x2 = facePoints[i].x2 >= width ? width : facePoints[i].x2;
+			facePoints[i].y2 = facePoints[i].y2 >= image.rows ? image.rows : facePoints[i].y2;
+			facePoints[i].x2 = facePoints[i].x2 >= image.cols ? image.cols : facePoints[i].x2;
 
 #if USED_WARPAFFINEI
 			warpAffineI(image, facePoints[i], FeatureMat);
@@ -183,16 +269,34 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 		m_feaExt->GetFaceFeature(FeatureMat, facePoints);
     }
 
+	if (dynamic_scale)
+	{
+		for (size_t i = 0; i < ret; i++)
+		{
+			facePoints[i].y1 = facePoints[i].y1 / scalfactor;
+			facePoints[i].x1 = facePoints[i].x1 / scalfactor;
+			facePoints[i].y2 = facePoints[i].y2 / scalfactor;
+			facePoints[i].x2 = facePoints[i].x2 / scalfactor;
+		}
+	}
+
     return ret;
 }
 
-FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoints, GetFaceType type)
+FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoints, bool dynamic_scale, GetFaceType type)
 {
+	while (g_EnableRelease)
+		usleep(1000);
+
+	float scalfactor = 1.;
 	FACE_NUMBERS ret = 0;
 	int width = image.cols;
 	int height = image.rows;
 	std::vector<cv::Mat> FeatureMat;
 	std::vector<FaceRect> faceInfo;
+
+	if (!m_InitStatus || image.empty() || nullptr == facePoints)
+		return ret;
 
     if(image.cols < 30 || image.rows < 30)
     	return ret;
@@ -203,21 +307,38 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 
 	if (GetFaceType::FACEBOX & type)
 	{
+		if (dynamic_scale)
+		{
+			scalfactor = normalization(image);
+		}
+		try {
 #if USED_RETINAFACE
-    	m_retinaFace->Detect(image, faceInfo);
+			m_retinaFace->Detect(image, faceInfo);
 #elif USED_MTCNN
-		m_mtcnn->Detect(image, faceInfo);
+			m_mtcnn->Detect(image, faceInfo);
 #endif
+		}
+		catch(/*dmlc::Error &err*/...)
+		{
+			ret = 0;
+			faceInfo.clear();
+		}
 		for(auto face : faceInfo)
 		{
 			facePoints[ret++] = face;
 		}
-	}
 
-	if(0 == ret) return ret;
+		if(0 == ret) return ret;
+	}
 
 	if (GetFaceType::FACEFEATURE & type)
 	{
+		if(0 == ret)
+		{
+			size_t i = 0;
+			while(facePoints[i++].score > 0.6)
+				ret++;
+		}
 		/*
 		 * 截取原图的指定位置大小的区域  dst_img = src_img(Range(0,100),Range(50,200));
 		 * 这里截取的就是原图第0行至第99行,第50列至199列的区域图像.这里要注意的就是Range的两个参数范围分别为左包含和右不包含
@@ -242,6 +363,18 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 
 		m_feaExt->GetFaceFeature(FeatureMat, facePoints);
 	}
+
+	if (dynamic_scale)
+	{
+		for (size_t i = 0; i < ret; i++)
+		{
+			facePoints[i].y1 = facePoints[i].y1 / scalfactor;
+			facePoints[i].x1 = facePoints[i].x1 / scalfactor;
+			facePoints[i].y2 = facePoints[i].y2 / scalfactor;
+			facePoints[i].x2 = facePoints[i].x2 / scalfactor;
+		}
+	}
+
 	return ret;
 }
 
@@ -249,6 +382,9 @@ bool GsFaceDetectSDK::getFacesFeatureResult(cv::Mat frame, float* feature)
 {
 	std::vector<cv::Mat> FeatureMat;
 	FaceRect face_point;
+
+	if (!m_InitStatus || frame.empty())
+		return false;
 
 #if USED_BGRToRGB
 	frame = BGRToRGB(frame);
@@ -269,7 +405,7 @@ bool GsFaceDetectSDK::getFacesFeatureResult(cv::Mat frame, float* feature)
 	return true;
 }
 
-void GsFaceDetectSDK::ReleaseResource(void)
+void GsFaceDetectSDK::ReleaseResource(int id)
 {
 #if USED_RETINAFACE
 	delete m_retinaFace;
@@ -277,7 +413,12 @@ void GsFaceDetectSDK::ReleaseResource(void)
 	delete m_mtcnn;
 #endif
 	delete m_feaExt;
-	//MXNotifyShutdown();
+	pthread_mutex_lock(&g_mutex);
+	g_EnableRelease = true;
+	usleep(100000);
+	MXStorageEmptyCache(mxnet::cpp::kGPU, id);
+	g_EnableRelease = false;
+	pthread_mutex_unlock(&g_mutex);
 }
 
 int GsFaceDetectSDK::getGPUCount(int* out)
@@ -285,9 +426,15 @@ int GsFaceDetectSDK::getGPUCount(int* out)
 	return MXGetGPUCount(out);
 }
 
-const char* GsFaceDetectSDK::getSDKVersion()
+const char* GsFaceDetectSDK::getSDKVersion(bool select)
 {
 	string version = VERSION;
+	if (!select)
+	{
+		int ver = 0;
+		MXGetVersion(&ver);
+		version = std::to_string(ver);
+	}
 	return version.c_str();
 }
 

@@ -4,13 +4,13 @@
 #include "opencv2/opencv.hpp"
 
 /*
- * version 2.0.0.0
+ * version 2.0.1.2
  * used RetinaFace model
  */
 #define GJSY_VERSION_EPOCH 2
 #define GJSY_VERSION_MAJOR 0
-#define GJSY_VERSION_MINOR 0
-#define GJSY_VERSION_REVISION 0
+#define GJSY_VERSION_MINOR 1
+#define GJSY_VERSION_REVISION 2
 
 //face feature array size
 #define FSIZE 512
@@ -32,6 +32,18 @@ typedef unsigned int FACE_NUMBERS;
 
 //define unsigned date type
 typedef unsigned char uchar;
+
+/*
+ * Scaling factor, Customization is not supported
+ */
+typedef enum ScalRatio
+{
+	//Face structure used
+	FACTOR_8_16 = 0x01,
+	FACTOR_4_3 = 0x02,
+	FACTOR_16_9 = 0x04,
+	FACTOR_16_10 = 0x08
+} GetScalRatio;
 
 /*
  * Specify to get the face data type
@@ -61,8 +73,15 @@ typedef struct MtcnnPar
     int minSize;
     float factor;
     int featureshape[2];
+    //RetinaFace used threshold[1]
     float threshold[3];
+    //RetinaFace used nms_threshold[0]
     float nms_threshold[3];
+    /*
+     * MultiScale Dynamic Picture used
+     */
+    int LongSideSize;
+    GetScalRatio scalRatio;
     char *featurelayername;
 } MtcnnPar, *pMtcnnPar;
 

@@ -11,6 +11,7 @@ NetStruct::NetStruct() : m_executor(nullptr)
 
 NetStruct::~NetStruct()
 {
+	DelExecutorNDarray();
     delete m_executor;
 }
 

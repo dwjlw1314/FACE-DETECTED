@@ -30,6 +30,7 @@ void FeaturExtract::SetParameter(const MtcnnPar* param)
     SetFeatureLayerName(param->featurelayername);
 }
 
+//GPU increase 200M
 void FeaturExtract::LoadParamtes(const string& model_name)
 {
     map<string, NDArray> paramters;
@@ -56,6 +57,7 @@ void FeaturExtract::InitFaceFeature(const string& path)
     m_Fnet = Symbol::Load(path+"/face/model-symbol.json").GetInternals()[m_FlayerName];
     LoadParamtes(path+"/face/model-0000.params");
     m_Args_Map["data"] = NDArray(Shape(1, 3, m_FeatureShape[0], m_FeatureShape[1]), g_GetContext());
+    //GPU increase 350M
     m_Fexecutor = m_Fnet.SimpleBind(g_GetContext(), m_Args_Map, map<string, NDArray>(),
     		map<string, OpReqType>(), m_Aux_Map);
 }
@@ -95,7 +97,6 @@ void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRec
 	size_t count = v_feature_mat.size();
 	m_Args_Map["data"] = NDArray(Shape(count, 3, m_FeatureShape[0], m_FeatureShape[1]), g_GetContext());
 	Mat2NDArray(v_feature_mat).CopyTo(&m_Args_Map["data"]);
-	NDArray::WaitAll();
 
 	delete m_Fexecutor;
 	m_Fexecutor = m_Fnet.SimpleBind(g_GetContext(), m_Args_Map, map<string, NDArray>(),
@@ -104,7 +105,7 @@ void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRec
 	m_Fexecutor->Forward(false);
 
 	/*out the features*/
-	auto array = m_Fexecutor->outputs[0].Copy(Context::cpu());
+	NDArray array = m_Fexecutor->outputs[0].Copy(Context::cpu());
 	NDArray::WaitAll();
 
 	for(size_t i = 0; i < count; i++)
@@ -117,7 +118,7 @@ void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRec
 	}
 }
 #else
-NDArray FeaturExtract::Mat2NDArray(cv::Mat& image)
+void FeaturExtract::Mat2NDArray(cv::Mat& image)
 {
     std::vector<float> array;
 
@@ -137,28 +138,33 @@ NDArray FeaturExtract::Mat2NDArray(cv::Mat& image)
     NDArray ret(Shape(1, 3, m_FeatureShape[0], m_FeatureShape[1]), Context::cpu());
     int length = 1 * 3 * m_FeatureShape[0] * m_FeatureShape[1];
     ret.SyncCopyFromCPU(array.data(), (size_t)length);
-    NDArray::WaitAll();
-    return ret;
+    ret.CopyTo(&m_Args_Map["data"]);
+	NDArray::WaitAll();
 }
 
 void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRect face_point)
 {
     for (auto image : v_feature_mat)
     {
-    	Mat2NDArray(image).CopyTo(&m_Args_Map["data"]);
-        NDArray::WaitAll();
+    	try {
+			Mat2NDArray(image);
 
-        m_Fexecutor->Forward(false);
+			m_Fexecutor->Forward(false);
 
-        /*out the features*/
-        auto array = m_Fexecutor->outputs[0].Copy(Context::cpu());
-        NDArray::WaitAll();
+			/*out the features*/
+			auto array = m_Fexecutor->outputs[0].Copy(Context::cpu());
+			NDArray::WaitAll();
 
-        for (size_t i = 0; i < FSIZE; i++)
-        {
-            face_point->feature[i] = array.At(0,i);
-        }
-        face_point++;
+	        for (size_t i = 0; i < FSIZE; i++)
+	        {
+	            face_point->feature[i] = array.At(0,i);
+	        }
+    	}
+    	catch(...)
+    	{
+    		face_point->score = 0.0;
+    	}
+    	face_point++;
     }
 }
 #endif

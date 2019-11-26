@@ -1,7 +1,5 @@
 ### Face Detected SDK ###
 
-## Version 1.0.0.2 ##
-
 ## hardware ##
 # nvidia Graphics card
 

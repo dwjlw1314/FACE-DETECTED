@@ -9,7 +9,7 @@
 #include "mxnet-cpp/MxNetCpp.h"
 #include "public_data.h"
 
-#define USE_MOREBATCH 1
+#define USE_MOREBATCH 0
 
 using namespace std;
 using namespace mxnet::cpp;
@@ -34,7 +34,7 @@ private:
 #if USE_MOREBATCH
     NDArray Mat2NDArray(std::vector<cv::Mat>&);
 #else
-    NDArray Mat2NDArray(cv::Mat&);
+    void Mat2NDArray(cv::Mat&);
 #endif
 
     void LoadParamtes(const string&);
