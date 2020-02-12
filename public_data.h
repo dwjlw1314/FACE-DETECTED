@@ -1,16 +1,19 @@
 #ifndef PUBLIC_DATA_H
 #define PUBLIC_DATA_H
 
+#include <Eigen/Dense>
 #include "opencv2/opencv.hpp"
+#include"opencv2/core/eigen.hpp"
 
 /*
- * version 2.0.1.2
- * used RetinaFace model
+ * version 2.0.1.4
+ * add similizerTransform internal interface
+ * modify interface function internal define
  */
 #define GJSY_VERSION_EPOCH 2
 #define GJSY_VERSION_MAJOR 0
 #define GJSY_VERSION_MINOR 1
-#define GJSY_VERSION_REVISION 2
+#define GJSY_VERSION_REVISION 4
 
 //face feature array size
 #define FSIZE 512
@@ -46,16 +49,20 @@ typedef enum ScalRatio
 } GetScalRatio;
 
 /*
- * Specify to get the face data type
+ * Specify to get the face data type, 4bit
  */
 typedef enum GetType
 {
-	//get face box and feature
-	FACEALL = 0x3,
 	//get only face box
 	FACEBOX = 0x1,
-	//get only face feature; unused
-	FACEFEATURE = 0x2
+	//get only face feature;
+	FACEFEATURE = 0x2,
+	//get only face gender and age; UNUSED
+	FACEGENDER = 0x4,
+	//get face box,feature
+	FACEBOXFEATURE = 0x3,
+	//get face box,feature and gender
+	FACEALL = 0x7
 } GetFaceType;
 
 /*
@@ -73,6 +80,7 @@ typedef struct MtcnnPar
     int minSize;
     float factor;
     int featureshape[2];
+    int gendershape[2];
     //RetinaFace used threshold[1]
     float threshold[3];
     //RetinaFace used nms_threshold[0]
@@ -83,6 +91,8 @@ typedef struct MtcnnPar
     int LongSideSize;
     GetScalRatio scalRatio;
     char *featurelayername;
+    //选择加载哪些模型
+    GetFaceType type;
 } MtcnnPar, *pMtcnnPar;
 
 /*
@@ -94,7 +104,17 @@ typedef struct FaceRect
     int y1;
     int x2;
     int y2;
+    /*
+     * return value: 0 male; 1 female; -1 UNKNOW
+     */
+    int gender;
+
     float score;
+    /*
+     * return value: 0.0 ~ 99.0
+     */
+    float age;
+
     float feature[FSIZE];
     FacePts facepts;
 

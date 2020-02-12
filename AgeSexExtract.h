@@ -1,34 +1,36 @@
-#ifndef FEATUREXTRACT_H
-#define FEATUREXTRACT_H
+/*
+ * AgeSexExtract.h
+ *
+ *  Created on: Nov 26, 2019
+ *      Author: ai_002
+ */
+
+#ifndef AGESEXEXTRACT_H_
+#define AGESEXEXTRACT_H_
 
 #include <iostream>
 #include <string>
 #include <vector>
 #include <map>
-
 #include "mxnet-cpp/MxNetCpp.h"
 #include "public_data.h"
-
-#define USE_MOREBATCH 0
 
 using namespace std;
 using namespace mxnet::cpp;
 using namespace IODATA;
 
-class FeaturExtract
+class AgeSexExtract
 {
 public:
-    FeaturExtract(const char*, MtcnnPar*, bool);
+	AgeSexExtract(const char*, MtcnnPar*, bool);
 
-    ~FeaturExtract();
+	~AgeSexExtract();
 
-    void InitFaceFeature(const string&);
+    void InitFaceGender(const string&);
 
     void SetParameter(const MtcnnPar*);
 
-    void GetFaceFeature(std::vector<cv::Mat>&, pFaceRect);
-
-    mx_float getSimilarity(const mx_float*, const mx_float*);
+    void GetFaceAgeSex(std::vector<cv::Mat>&, pFaceRect);
 
 private:
 #if USE_MOREBATCH
@@ -37,30 +39,27 @@ private:
     void Mat2NDArray(cv::Mat&);
 #endif
 
-	void setContext(int id = 0, DeviceType type = kCPU);
+    void setContext(int, DeviceType);
 
     void LoadParamtes(const string&);
 
-    mx_float getMold(const mx_float*);
+    void SetGenderLayerName(string);
 
-    void SetFeatureLayerName(string);
-
-    void SetFeatureShape(const int (&)[2]);
+    void SetGenderShape(const int (&)[2]);
 
 private:
 	int m_deviceId;
 	DeviceType m_deviceType;
-
     Context *m_ctx = nullptr;
 
-    int m_FeatureShape[2];
+    int m_GenderShape[2];
     string m_FlayerName;
 
-    Symbol m_Fnet;
-    Executor* m_Fexecutor;
+    Symbol m_Gnet;
+    Executor* m_Gender;
 
     map<string, NDArray> m_Args_Map;
     map<string, NDArray> m_Aux_Map;
 };
 
-#endif // FEATUREXTRACT_H
+#endif /* AGESEXEXTRACT_H_ */

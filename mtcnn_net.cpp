@@ -209,9 +209,9 @@ void MTCNN::Detect(const cv::Mat& image, std::vector<FaceRect>& faceInfo)
         std::vector<cv::Mat> input_channels;
         //wrap image and normalization using INTER_AREA method
 #ifdef INTER_FAST
-        cv::resize(sample_single,resized, cv::Size(ws,hs), 0, 0, cv::INTER_NEAREST);
+        cv::resize(sample_single,resized, cv::Size(ws,hs), 0, 0, cv::INTER_CUBIC);
 #else
-        cv::resize(sample_single,resized, cv::Size(ws,hs), 0, 0, cv::INTER_AREA);
+        cv::resize(sample_single,resized, cv::Size(ws,hs), 0, 0, cv::INTER_CUBIC);
 #endif
         resized.convertTo(resized, CV_32FC3, 0.0078125, -127.5 * 0.0078125);
 
@@ -488,9 +488,9 @@ void MTCNN::ClassifyFace(const std::vector<FaceRect>& regressed_rects, cv::Mat& 
         cv::copyMakeBorder(crop_img, crop_img, pad_top, pad_bottom, pad_left, pad_right, cv::BORDER_CONSTANT, cv::Scalar(0));
 
 #ifdef INTER_FAST
-        cv::resize(crop_img, crop_img, cv::Size(input_width,input_height), 0, 0, cv::INTER_NEAREST);
+        cv::resize(crop_img, crop_img, cv::Size(input_width,input_height), 0, 0, cv::INTER_CUBIC);
 #else
-        cv::resize(crop_img, crop_img, cv::Size(input_width,input_height), 0, 0, cv::INTER_AREA);
+        cv::resize(crop_img, crop_img, cv::Size(input_width,input_height), 0, 0, cv::INTER_CUBIC);
 #endif
 
         crop_img = (crop_img-127.5)*0.0078125;
@@ -578,9 +578,9 @@ void MTCNN::ClassifyFace_MulImage(const std::vector<FaceRect>& regressed_rects, 
         cv::copyMakeBorder(crop_img, crop_img, pad_left, pad_right, pad_top, pad_bottom, cv::BORDER_CONSTANT, cv::Scalar(0));
 
 #ifdef INTER_FAST
-        cv::resize(crop_img, crop_img, cv::Size(input_width, input_height), 0, 0, cv::INTER_NEAREST);
+        cv::resize(crop_img, crop_img, cv::Size(input_width, input_height), 0, 0, cv::INTER_CUBIC);
 #else
-        cv::resize(crop_img, crop_img, cv::Size(input_width, input_height), 0, 0, cv::INTER_AREA);
+        cv::resize(crop_img, crop_img, cv::Size(input_width, input_height), 0, 0, cv::INTER_CUBIC);
 #endif
 
         crop_img = (crop_img-127.5)*0.0078125;

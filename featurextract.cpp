@@ -1,21 +1,32 @@
 #include "featurextract.h"
 
-extern Context g_GetContext();
-
-FeaturExtract::FeaturExtract(const char* path, MtcnnPar *param)
+FeaturExtract::FeaturExtract(const char* path, MtcnnPar *param, bool useGpu)
 {
+	if (useGpu)
+		setContext(param->devid, mxnet::cpp::kGPU);
+	else
+		setContext(param->devid, mxnet::cpp::kCPU);
+
 	SetParameter(param);
 	InitFaceFeature(path);
 }
 
 FeaturExtract::~FeaturExtract()
 {
+	delete m_ctx;
 	delete m_Fexecutor;
 }
 
 inline void FeaturExtract::SetFeatureLayerName(string layer_name)
 {
 	m_FlayerName = layer_name;
+}
+
+void FeaturExtract::setContext(int id, DeviceType type)
+{
+	m_deviceId = id;
+	m_deviceType = type;
+	m_ctx = new Context(type, id);
 }
 
 inline void FeaturExtract::SetFeatureShape(const int (&array)[2])
@@ -40,12 +51,12 @@ void FeaturExtract::LoadParamtes(const string& model_name)
         if (k.first.substr(0, 4) == "aux:")
         {
             auto name = k.first.substr(4, k.first.size() - 4);
-            m_Aux_Map[name] = k.second.Copy(g_GetContext());
+            m_Aux_Map[name] = k.second.Copy(*m_ctx);
         }
         if (k.first.substr(0, 4) == "arg:")
         {
             auto name = k.first.substr(4, k.first.size() - 4);
-            m_Args_Map[name] = k.second.Copy(g_GetContext());
+            m_Args_Map[name] = k.second.Copy(*m_ctx);
         }
     }
     /*WaitAll is need when we copy data between GPU and the main memory*/
@@ -56,9 +67,9 @@ void FeaturExtract::InitFaceFeature(const string& path)
 {
     m_Fnet = Symbol::Load(path+"/face/model-symbol.json").GetInternals()[m_FlayerName];
     LoadParamtes(path+"/face/model-0000.params");
-    m_Args_Map["data"] = NDArray(Shape(1, 3, m_FeatureShape[0], m_FeatureShape[1]), g_GetContext());
+    m_Args_Map["data"] = NDArray(Shape(1, 3, m_FeatureShape[0], m_FeatureShape[1]), *m_ctx);
     //GPU increase 350M
-    m_Fexecutor = m_Fnet.SimpleBind(g_GetContext(), m_Args_Map, map<string, NDArray>(),
+    m_Fexecutor = m_Fnet.SimpleBind(*m_ctx, m_Args_Map, map<string, NDArray>(),
     		map<string, OpReqType>(), m_Aux_Map);
 }
 
@@ -72,7 +83,7 @@ NDArray FeaturExtract::Mat2NDArray(std::vector<cv::Mat>& v_feature_mat)
 	std::vector<float> array;
 	for(auto image : v_feature_mat)
 	{
-		if (image.cols != 112 || image.rows != 112)
+		if (image.cols != m_FeatureShape[0] || image.rows != m_FeatureShape[1])
 			cv::resize(image, image, cv::Size(m_FeatureShape[0], m_FeatureShape[1]));
 
 		for (int c = 0; c < 3; ++c)
@@ -99,7 +110,7 @@ void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRec
 	Mat2NDArray(v_feature_mat).CopyTo(&m_Args_Map["data"]);
 
 	delete m_Fexecutor;
-	m_Fexecutor = m_Fnet.SimpleBind(g_GetContext(), m_Args_Map, map<string, NDArray>(),
+	m_Fexecutor = m_Fnet.SimpleBind(*m_ctx, m_Args_Map, map<string, NDArray>(),
 			map<string, OpReqType>(), m_Aux_Map);
 
 	m_Fexecutor->Forward(false);
@@ -122,7 +133,7 @@ void FeaturExtract::Mat2NDArray(cv::Mat& image)
 {
     std::vector<float> array;
 
-    if (image.cols != 112 || image.rows != 112)
+    if (image.cols != m_FeatureShape[0] || image.rows != m_FeatureShape[1])
     	cv::resize(image, image, cv::Size(m_FeatureShape[0], m_FeatureShape[1]));
 
     for (int c = 0; c < 3; ++c)
@@ -139,7 +150,7 @@ void FeaturExtract::Mat2NDArray(cv::Mat& image)
     int length = 1 * 3 * m_FeatureShape[0] * m_FeatureShape[1];
     ret.SyncCopyFromCPU(array.data(), (size_t)length);
     ret.CopyTo(&m_Args_Map["data"]);
-	NDArray::WaitAll();
+	NDArray::WaitAll();  //ret.WaitToRead();
 }
 
 void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRect face_point)
@@ -155,10 +166,19 @@ void FeaturExtract::GetFaceFeature(std::vector<cv::Mat>& v_feature_mat, pFaceRec
 			auto array = m_Fexecutor->outputs[0].Copy(Context::cpu());
 			NDArray::WaitAll();
 
-	        for (size_t i = 0; i < FSIZE; i++)
+			const mx_float *out_data = array.GetData();
+			size_t out_data_size = array.Size();
+
+	        for (size_t i = 0; i < out_data_size; i++)
 	        {
-	            face_point->feature[i] = array.At(0,i);
+	            face_point->feature[i] = out_data[i];
 	        }
+
+	        mx_float tf = getMold(face_point->feature);
+	        for (size_t i = 0; i < out_data_size; i++)
+			{
+				face_point->feature[i] = out_data[i] / tf ;
+			}
     	}
     	catch(...)
     	{
@@ -184,6 +204,7 @@ mx_float FeaturExtract::getSimilarity(const mx_float* lhs, const mx_float* rhs)
      mx_float tmp = 0.0;  //内积
      for (int i = 0; i < FSIZE; ++i)
          tmp += lhs[i] * rhs[i];
-     return tmp / (getMold(lhs)*getMold(rhs));
+     //return tmp / (getMold(lhs)*getMold(rhs));
+     return tmp;
 }
 

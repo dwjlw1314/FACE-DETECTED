@@ -2,9 +2,10 @@
 #include "mtcnn_net.h"
 #include "RetinaFace.h"
 #include "featurextract.h"
+#include "AgeSexExtract.h"
 
-//2.0.1.2 use #define value
-#define VERSION "2.0.1.2"
+//2.0.1.4 use #define value
+#define VERSION "2.0.1.4"
 
 #define USED_TRACKER 0
 #define USED_WARPAFFINEI 1
@@ -16,9 +17,15 @@ using namespace cv;
 
 int g_DeviceId;
 DeviceType g_DeviceType;
+
 bool g_EnableRelease = false;
 //sync_mutex
-pthread_mutex_t g_mutex = PTHREAD_MUTEX_INITIALIZER;
+/*
+ * set PTHREAD_MUTEX_INITIALIZER running error
+ * __pthread_tpp_change_priority: Assertion 'new_prot == -1 ||
+ * (new_prot >= fifo_min_prio && new_prot <= fifo_max_prio') failed
+ */
+pthread_mutex_t g_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 
 void g_SetContext(int id = 0, DeviceType type = mxnet::cpp::kCPU)
 {
@@ -35,11 +42,23 @@ Context g_GetContext()
     return Context::cpu(g_DeviceId);
 }
 
-MtcnnPar default_par{0, 40, 0.509,	{112,112}, {0.6,0.8,0.9},
-	{0.5,0.7,0.7}, 1920, FACTOR_16_9, (char*)"fc1_output"};
+MtcnnPar default_par{0, 40, 0.509,	{56,56}, {112,112}, {0.6,0.8,0.9},
+	{0.4,0.7,0.7}, 1920, FACTOR_16_9, (char*)"fc1_output", FACEALL};
+
+float landmark_56[5][2] = {{30.2946f/2 + 4.0, 51.6963f/2},
+						{65.5318f/2 + 4.0, 51.5014f/2},
+						{48.0252f/2 + 4.0, 71.7366f/2},
+						{33.5493f/2 + 4.0, 92.3655f/2},
+						{62.7299f/2 + 4.0, 92.2041f/2}};
+
+float landmark_112[5][2] = {{30.2946f + 8.0, 51.6963f},
+						{65.5318f + 8.0, 51.5014f},
+						{48.0252f + 8.0, 71.7366f},
+						{33.5493f + 8.0, 92.3655f},
+						{62.7299f + 8.0, 92.2041f}};
 
 GsFaceDetectSDK::GsFaceDetectSDK(const char* path, MtcnnPar *param, bool useGpu)
-	: m_mtcnn(nullptr), m_retinaFace(nullptr), m_feaExt(nullptr)
+	: m_mtcnn(nullptr), m_retinaFace(nullptr), m_feaExt(nullptr), m_genderExt(nullptr)
 {
 	//init default par member
 	if (!param)
@@ -58,27 +77,31 @@ GsFaceDetectSDK::GsFaceDetectSDK(const char* path, MtcnnPar *param, bool useGpu)
 			m_pictureHSize = m_pictureWSize*10/16; break;
 	}
 
-	if (useGpu)
-		g_SetContext(param->devid, mxnet::cpp::kGPU);
-	else
-		g_SetContext(param->devid, mxnet::cpp::kCPU);
-
-	m_OutWidth = param->featureshape[0];
-	m_OutHeight = param->featureshape[1];
+	m_fshape[0] = param->featureshape[0];
+	m_fshape[1] = param->featureshape[1];
+	m_gshape[0] = param->gendershape[0];
+	m_gshape[1] = param->gendershape[1];
 
 	pthread_mutex_lock(&g_mutex);
 
 	try {
+		if(param->type & FACEBOX)
+		{
 #if USED_RETINAFACE
-		m_retinaFace = new RetinaFace(path, param, useGpu);
+			m_retinaFace = new RetinaFace(path, param, useGpu);
 #elif USED_MTCNN
-		m_mtcnn = new MTCNN(path, param, useGpu);
+			m_mtcnn = new MTCNN(path, param, useGpu);
 #endif
-		m_feaExt = new FeaturExtract(path, param);
+		}
+		if(param->type & FACEFEATURE)
+			m_feaExt = new FeaturExtract(path, param, useGpu);
+		if(param->type & FACEGENDER)
+			m_genderExt = new AgeSexExtract(path, param, useGpu);
 		m_InitStatus = true;
 	}
 	catch(/*dmlc::Error &err*/...)
 	{
+		//cout << "dmlc::Error: " << err.what() << endl;
 		m_InitStatus = false;
 	}
 
@@ -86,34 +109,222 @@ GsFaceDetectSDK::GsFaceDetectSDK(const char* path, MtcnnPar *param, bool useGpu)
 	pthread_mutex_unlock(&g_mutex);
 }
 
-void GsFaceDetectSDK::warpAffineI(cv::Mat& image, FaceRect& faceRect, std::vector<cv::Mat>& featureMat)
+void GsFaceDetectSDK::warpAffineI(cv::Mat& image, FaceRect& faceRect, std::vector<cv::Mat>& featureMat, GetFaceType type)
 {
-	float landmarks[5][2] = {{30.2946f + 8.0, 51.6963f},
-							{65.5318f + 8.0, 51.5014f},
-							{48.0252f + 8.0, 71.7366f},
-							{33.5493f + 8.0, 92.3655f},
-							{62.7299f + 8.0, 92.2041f}};
-	//对齐点的Point2f数组,检测到的人脸对齐点，注意这里是基于原始图像的坐标点
-	cv::Point2f srcTri[5];
-	//对齐点的Point2f数组,模板的Landmarks，注意这是一个基于输出图像大小尺寸的坐标点
-	cv::Point2f destTri[5];
+	size_t shape[2];
+	float (*landmarks)[5][2];
 
-	for (int i = 0; i < 5; i++)
+	if (type == FACEGENDER)
 	{
-		srcTri[i] = Point2f(faceRect.facepts.x[i]-faceRect.x1, faceRect.facepts.y[i]-faceRect.y1);
-		destTri[i] = Point2f(landmarks[i][0] , landmarks[i][1]);
+		shape[0] = m_gshape[0];
+		shape[1] = m_gshape[1];
+	}
+	else
+	{
+		shape[0] = m_fshape[0];
+		shape[1] = m_fshape[1];
 	}
 
-	Mat warp_frame(m_OutWidth, m_OutHeight, CV_32FC3);
+	if (shape[0] == 56)
+		landmarks = &landmark_56;
+	else
+		landmarks = &landmark_112;
 
-	Mat warp_mat = getAffineTransform(srcTri, destTri);
-	//使用相似变换，不适合使用仿射变换，会导致图像变形,ref:opencv_videoio
-	//Mat warp_ma = estimateRigidTransform(image, warp_frame, false);
+	//对齐点的Point2f数组,检测到的人脸对齐点，注意这里是基于原始图像的坐标点
+	MatrixXd srcM(5,2);
+	//对齐点的Point2f数组,模板的Landmarks，注意这是一个基于输出图像大小尺寸的坐标点
+	MatrixXd dstM(5,2);
+
+	for(int i = 0; i < 5; i++)
+	{
+		srcM(i,0) = faceRect.facepts.x[i]-faceRect.x1;
+		srcM(i,1) = faceRect.facepts.y[i]-faceRect.y1;
+		dstM(i,0) = (*landmarks)[i][0];
+		dstM(i,1) = (*landmarks)[i][1];
+	}
+
+	Mat warp_frame(shape[0], shape[1], image.type());
+
+	Mat warp_mat = similizerTransform(srcM, dstM, true).clone();
 
 	warpAffine(image(cv::Range(faceRect.y1, faceRect.y2), cv::Range(faceRect.x1, faceRect.x2)),
-			warp_frame, warp_mat, warp_frame.size(), 1, 0, 0);
+			warp_frame, warp_mat, warp_frame.size(), 2, 0, 0);
 
 	featureMat.push_back(warp_frame);
+}
+
+void GsFaceDetectSDK::warpAffineI(cv::Mat& image, FacePts& facepts, std::vector<cv::Mat>& featureMat, GetFaceType type)
+{
+	size_t shape[2];
+	float (*landmarks)[5][2];
+
+	if (type == FACEGENDER)
+	{
+		shape[0] = m_gshape[0];
+		shape[1] = m_gshape[1];
+	}
+	else
+	{
+		shape[0] = m_fshape[0];
+		shape[1] = m_fshape[1];
+	}
+
+	if (shape[0] == 56)
+		landmarks = &landmark_56;
+	else
+		landmarks = &landmark_112;
+
+	//对齐点的Point2f数组,检测到的人脸对齐点，注意这里是基于原始图像的坐标点
+	MatrixXd srcM(5,2);
+	//对齐点的Point2f数组,模板的Landmarks，注意这是一个基于输出图像大小尺寸的坐标点
+	MatrixXd dstM(5,2);
+
+	for(int i = 0; i < 5; i++)
+	{
+		srcM(i,0) = facepts.x[i];
+		srcM(i,1) = facepts.y[i];
+		dstM(i,0) = (*landmarks)[i][0];
+		dstM(i,1) = (*landmarks)[i][1];
+	}
+
+	Mat warp_frame(shape[0], shape[1], image.type());
+
+    Mat warp_mat = similizerTransform(srcM, dstM, true).clone();
+
+	warpAffine(image, warp_frame, warp_mat, warp_frame.size(), 2, 0, 0);
+
+	featureMat.push_back(warp_frame);
+}
+
+Mat GsFaceDetectSDK::similizerTransform(MatrixXd& src, MatrixXd& dst, bool estimate_scale)  //输入：目标点，原图点，是否scale（这里为true）
+{
+	int num = 5;
+	int dim = 2;
+
+	MatrixXd src_mean(5,2);
+	MatrixXd dst_mean(5,2);
+
+	src_mean(0,0) = src.col(0).mean();
+	src_mean(0,1) = src.col(1).mean();
+	dst_mean(0,0) = dst.col(0).mean();
+	dst_mean(0,1) = dst.col(1).mean();
+	src_mean.col(0).fill(src_mean(0,0));
+	src_mean.col(1).fill(src_mean(0,1));
+	dst_mean.col(0).fill(dst_mean(0,0));
+	dst_mean.col(1).fill(dst_mean(0,1));
+
+	MatrixXd src_demean(5,2);
+	MatrixXd dst_demean(5,2);
+
+	src_demean = src.array() - src_mean.array();
+	dst_demean = dst.array() - dst_mean.array();
+
+	MatrixXd A;
+	A = (dst_demean.transpose() * src_demean) / num;
+
+	MatrixXd d;
+	d.setOnes(1, dim);
+
+	if (A.determinant() < 0)
+		d(0, dim - 1) = -1;
+
+	MatrixXd T;
+	T.setIdentity(3,3);
+
+	Eigen::JacobiSVD<Eigen::MatrixXd> svd(A, Eigen::ComputeFullV | Eigen::ComputeFullU); // ComputeThinU | ComputeThinV
+	Eigen::MatrixXd S = svd.singularValues();
+	Eigen::MatrixXd U = svd.matrixU();
+	Eigen::MatrixXd V = svd.matrixV();
+
+	FullPivLU<MatrixXd> lu(A);
+	auto rank = lu.rank();
+
+	if (rank == 0)
+	{
+		//如果A的秩为0， 返回T的无效值
+		Mat mat;
+		return mat;
+	}
+	else if (rank == dim - 1)
+	{
+		if (U.determinant() * V.determinant() > 0) //#矩阵U、V的行列式的值
+		{
+			auto tmp = U * V;
+			T.topLeftCorner(dim,dim) << tmp(0,0),tmp(0,1),tmp(1,0),tmp(1,1);  //# @为矩阵点乘
+		}
+		else
+		{
+			auto s = d(0, dim - 1);
+			d(0, dim - 1) = -1;
+			//np.diag是将矩阵d[1., 1.]改写为[1., 0; 0, 1.]
+			MatrixXd tmp_;
+			tmp_.setZero(dim,dim);
+			tmp_(0,0) = d(0,0);
+			tmp_(1,1) = d(0,1);
+			auto tmp = U * tmp_ * V;
+			T.topLeftCorner(dim,dim) << tmp(0,0),tmp(0,1),tmp(1,0),tmp(1,1);
+			d(0, dim - 1) = s;
+		}
+	}
+	else
+	{
+		MatrixXd tmp_;
+		tmp_.setZero(dim,dim);
+		tmp_(0,0) = d(0,0);
+		tmp_(1,1) = d(0,1);
+		auto tmp = U * tmp_ * V;
+		T.topLeftCorner(dim,dim) << tmp(0,0),tmp(0,1),tmp(1,0),tmp(1,1);;
+	}
+	float scale;
+    if (estimate_scale)
+    {
+       //# .var(axis=0).sum() 是求src_demean矩阵在列方向上的方差，后再求和
+    	Eigen::MatrixXd mean = src_demean.colwise().mean();
+
+    	Eigen::MatrixXd sqsum_ = src_demean.transpose() * src_demean;
+
+    	Eigen::MatrixXd ide = MatrixXd::Identity(2,2);
+//    	Eigen::MatrixXd temp = sqsum_.cwiseProduct(ide);
+//    	std::cout << sqsum_.array() * ide.array() << std::endl;
+    	Eigen::MatrixXd sqsum = sqsum_.cwiseProduct(ide).colwise().sum();
+
+    	Eigen::MatrixXd scale_(1,2);
+    	float _scale_ = 1. / num;
+    	scale_ <<  _scale_, _scale_;
+    	Eigen::MatrixXd variance_ = sqsum .array()* scale_.array() - mean.array() * mean.array();
+
+    	float _variance_ = variance_.sum();
+    	_variance_ = 1. / _variance_;
+
+    	scale = _variance_ * (d * S)(0,0);
+    }
+    else
+    {
+    	scale = 1.0;
+    }
+
+    Eigen::MatrixXd ss(2,1);
+    ss << scale,scale;
+    Eigen::MatrixXd src_mean_ = (ss.array() * (T.topLeftCorner(dim,dim) * src_mean.topLeftCorner(1,2).transpose()).array());
+    Eigen::MatrixXd dst_mean_ = dst_mean.topLeftCorner(1,2).transpose();
+
+    Eigen::MatrixXd T_ = dst_mean_.array() - src_mean_.array();
+    T(0,2) = T_(0,0);
+    T(1,2) = T_(1,0);
+
+    Eigen::MatrixXd sss(2,2);
+    sss << scale,scale,scale,scale;
+    Eigen::MatrixXd _T__ = T.topLeftCorner(2,2);
+    Eigen::MatrixXd _T_ = _T__.cwiseProduct(sss);
+    T.topLeftCorner(2,2) << _T_(0,0),_T_(0,1),_T_(1,0),_T_(1,1);
+
+    Eigen::MatrixXd M = T.topLeftCorner(2,3);
+
+	//#最终结果，我们要的矩阵M 3*3 to 2*3
+	cv::Mat rr;
+	cv::eigen2cv(M,rr);
+
+    return rr;
 }
 
 #if USED_BGRToRGB
@@ -160,7 +371,7 @@ float GsFaceDetectSDK::normalization(cv::Mat& src)
 			scalfactor = float(m_pictureWSize)/(float)w;
 		else
 			scalfactor = float(m_pictureHSize)/(float)h;
-		resize(src,src,Size(w*scalfactor, h*scalfactor), 0, 0, cv::INTER_LINEAR);
+		resize(src,src,Size(w*scalfactor, h*scalfactor), 0, 0, cv::INTER_CUBIC);
 	}
     copyMakeBorder(src, src, 0, m_pictureHSize-src.rows, 0, m_pictureWSize-src.cols, BORDER_CONSTANT, color);
 
@@ -188,6 +399,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
     FACE_NUMBERS ret = 0;
     std::vector<FaceRect> faceInfo;
     std::vector<cv::Mat> FeatureMat;
+    std::vector<cv::Mat> GenderMat;
     cv::Mat image(height, width, CV_8UC3);
 
     if(!m_InitStatus || nullptr == data || nullptr == facePoints)
@@ -208,7 +420,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 	image = BGRToRGB(image);
 #endif
 
-    if (GetFaceType::FACEBOX & type)
+	if ((GetFaceType::FACEBOX & type) && (m_retinaFace || m_mtcnn))
     {
     	if (dynamic_scale)
     	{
@@ -236,7 +448,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 		if(0 == ret) return ret;
     }
 
-    if (GetFaceType::FACEFEATURE & type)
+    if ((GetFaceType::FACEFEATURE & type) && m_feaExt)
 	{
 		size_t i = 0;
 		if(0 == ret)
@@ -256,7 +468,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 			facePoints[i].x2 = facePoints[i].x2 >= image.cols ? image.cols : facePoints[i].x2;
 
 #if USED_WARPAFFINEI
-			warpAffineI(image, facePoints[i], FeatureMat);
+			warpAffineI(image, facePoints[i], FeatureMat, FACEFEATURE);
 #else
 			int x1 = facePoints[i].x1;
 			int x2 = facePoints[i].x2;
@@ -269,6 +481,38 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 		m_feaExt->GetFaceFeature(FeatureMat, facePoints);
     }
 
+    if ((GetFaceType::FACEGENDER & type) && m_genderExt)
+    {
+		size_t i = 0;
+		if(0 == ret)
+		{
+			while(facePoints[i++].score > 0.6)
+				ret++;
+		}
+		/*
+		 * 截取原图的指定位置大小的区域  dst_img = src_img(Range(0,100),Range(50,200));
+		 * 这里截取的就是原图第0行至第99行,第50列至199列的区域图像.这里要注意的就是Range的两个参数范围分别为左包含和右不包含
+		*/
+		for (size_t i = 0; i < ret; i++)
+		{
+			facePoints[i].y1 = facePoints[i].y1 <= 0 ? 0 : facePoints[i].y1;
+			facePoints[i].x1 = facePoints[i].x1 <= 0 ? 0 : facePoints[i].x1;
+			facePoints[i].y2 = facePoints[i].y2 >= image.rows ? image.rows : facePoints[i].y2;
+			facePoints[i].x2 = facePoints[i].x2 >= image.cols ? image.cols : facePoints[i].x2;
+
+#ifdef USED_WARPAFFINEI
+			warpAffineI(image, facePoints[i], GenderMat, FACEGENDER);
+#else
+			int x1 = facePoints[i].x1;
+			int x2 = facePoints[i].x2;
+			int y1 = facePoints[i].y1;
+			int y2 = facePoints[i].y2;
+			GenderMat.push_back(image(cv::Range(y1, y2), cv::Range(x1, x2)));
+#endif
+		}
+		m_genderExt->GetFaceAgeSex(GenderMat, facePoints);
+    }
+
 	if (dynamic_scale)
 	{
 		for (size_t i = 0; i < ret; i++)
@@ -277,6 +521,11 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(const uchar* data, int width, in
 			facePoints[i].x1 = facePoints[i].x1 / scalfactor;
 			facePoints[i].y2 = facePoints[i].y2 / scalfactor;
 			facePoints[i].x2 = facePoints[i].x2 / scalfactor;
+			for (int j = 0; j < 5; j++)
+			{
+				facePoints[i].facepts.x[j] = facePoints[i].facepts.x[j] / scalfactor;
+				facePoints[i].facepts.y[j] = facePoints[i].facepts.y[j] / scalfactor;
+			}
 		}
 	}
 
@@ -293,6 +542,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 	int width = image.cols;
 	int height = image.rows;
 	std::vector<cv::Mat> FeatureMat;
+	std::vector<cv::Mat> GenderMat;
 	std::vector<FaceRect> faceInfo;
 
 	if (!m_InitStatus || image.empty() || nullptr == facePoints)
@@ -305,7 +555,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 	image = BGRToRGB(image);
 #endif
 
-	if (GetFaceType::FACEBOX & type)
+	if ((GetFaceType::FACEBOX & type) && (m_retinaFace || m_mtcnn))
 	{
 		if (dynamic_scale)
 		{
@@ -331,7 +581,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 		if(0 == ret) return ret;
 	}
 
-	if (GetFaceType::FACEFEATURE & type)
+	if ((GetFaceType::FACEFEATURE & type) && m_feaExt)
 	{
 		if(0 == ret)
 		{
@@ -351,7 +601,7 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 			facePoints[i].x2 = facePoints[i].x2 > width ? width : facePoints[i].x2;
 
 #if USED_WARPAFFINEI
-			warpAffineI(image, facePoints[i], FeatureMat);
+			warpAffineI(image, facePoints[i], FeatureMat, FACEFEATURE);
 #else
 			int x1 = facePoints[i].x1;
 			int x2 = facePoints[i].x2;
@@ -364,6 +614,38 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 		m_feaExt->GetFaceFeature(FeatureMat, facePoints);
 	}
 
+    if ((GetFaceType::FACEGENDER & type) && m_genderExt)
+    {
+		size_t i = 0;
+		if(0 == ret)
+		{
+			while(facePoints[i++].score > 0.6)
+				ret++;
+		}
+		/*
+		 * 截取原图的指定位置大小的区域  dst_img = src_img(Range(0,100),Range(50,200));
+		 * 这里截取的就是原图第0行至第99行,第50列至199列的区域图像.这里要注意的就是Range的两个参数范围分别为左包含和右不包含
+		*/
+		for (size_t i = 0; i < ret; i++)
+		{
+			facePoints[i].y1 = facePoints[i].y1 <= 0 ? 0 : facePoints[i].y1;
+			facePoints[i].x1 = facePoints[i].x1 <= 0 ? 0 : facePoints[i].x1;
+			facePoints[i].y2 = facePoints[i].y2 >= image.rows ? image.rows : facePoints[i].y2;
+			facePoints[i].x2 = facePoints[i].x2 >= image.cols ? image.cols : facePoints[i].x2;
+
+#ifdef USED_WARPAFFINEI
+			warpAffineI(image, facePoints[i], GenderMat, FACEGENDER);
+#else
+			int x1 = facePoints[i].x1;
+			int x2 = facePoints[i].x2;
+			int y1 = facePoints[i].y1;
+			int y2 = facePoints[i].y2;
+			GenderMat.push_back(image(cv::Range(y1, y2), cv::Range(x1, x2)));
+#endif
+		}
+		m_genderExt->GetFaceAgeSex(GenderMat, facePoints);
+    }
+
 	if (dynamic_scale)
 	{
 		for (size_t i = 0; i < ret; i++)
@@ -372,30 +654,39 @@ FACE_NUMBERS GsFaceDetectSDK::getFacesAllResult(cv::Mat image, pFaceRect facePoi
 			facePoints[i].x1 = facePoints[i].x1 / scalfactor;
 			facePoints[i].y2 = facePoints[i].y2 / scalfactor;
 			facePoints[i].x2 = facePoints[i].x2 / scalfactor;
+			for (int j = 0; j < 5; j++)
+			{
+				facePoints[i].facepts.x[j] = facePoints[i].facepts.x[j] / scalfactor;
+				facePoints[i].facepts.y[j] = facePoints[i].facepts.y[j] / scalfactor;
+			}
 		}
 	}
 
 	return ret;
 }
 
-bool GsFaceDetectSDK::getFacesFeatureResult(cv::Mat frame, float* feature)
+bool GsFaceDetectSDK::getFacesFeatureResult(cv::Mat& frame, FacePts& facepts, float* feature)
 {
 	std::vector<cv::Mat> FeatureMat;
 	FaceRect face_point;
 
-	if (!m_InitStatus || frame.empty())
+	if (!m_InitStatus || frame.empty() || nullptr == m_feaExt)
 		return false;
 
 #if USED_BGRToRGB
 	frame = BGRToRGB(frame);
 #endif
 
-	/*
-	 * 截取原图的指定位置大小的区域  dst_img = src_img(Range(0,100),Range(50,200));
-	 * 这里截取的就是原图第0行至第99行,第50列至199列的区域图像.这里要注意的就是Range的两个参数范围分别为左包含和右不包含
-	*/
+#if USED_WARPAFFINEI
+	warpAffineI(frame, facepts, FeatureMat, FACEFEATURE);
+#else
 	FeatureMat.push_back(frame);
+#endif
+
 	m_feaExt->GetFaceFeature(FeatureMat, &face_point);
+
+//	if (abs(face_point.score) < 0.4)
+//		return false;
 
 	memset(feature,0,FSIZE);
 
@@ -405,14 +696,41 @@ bool GsFaceDetectSDK::getFacesFeatureResult(cv::Mat frame, float* feature)
 	return true;
 }
 
+bool GsFaceDetectSDK::getFacesAgeSexResult(cv::Mat& frame, FacePts& facepts, FaceRect& facerect)
+{
+	std::vector<cv::Mat> GenderMat;
+
+	if (!m_InitStatus || frame.empty() || nullptr == m_genderExt)
+		return false;
+
+#if USED_BGRToRGB
+	frame = BGRToRGB(frame);
+#endif
+
+#ifdef USED_WARPAFFINEI
+	warpAffineI(frame, facepts, GenderMat, FACEGENDER);
+#else
+	GenderMat.push_back(frame);
+#endif
+
+	m_genderExt->GetFaceAgeSex(GenderMat, &facerect);
+
+	return true;
+}
+
 void GsFaceDetectSDK::ReleaseResource(int id)
 {
 #if USED_RETINAFACE
-	delete m_retinaFace;
+	if (m_retinaFace)
+		delete m_retinaFace;
 #elif USED_MTCNN
-	delete m_mtcnn;
+	if (m_mtcnn)
+		delete m_mtcnn;
 #endif
-	delete m_feaExt;
+	if (m_feaExt)
+		delete m_feaExt;
+	if (m_genderExt)
+		delete m_genderExt;
 	pthread_mutex_lock(&g_mutex);
 	g_EnableRelease = true;
 	usleep(100000);
@@ -438,7 +756,24 @@ const char* GsFaceDetectSDK::getSDKVersion(bool select)
 	return version.c_str();
 }
 
-float GsFaceDetectSDK::compares(const float* feature1, const float* feature2)
+float GsFaceDetectSDK::compares(const float* feature1, const float* feature2, int fnum)
 {
-    return m_feaExt->getSimilarity(feature1, feature2);
+	float sim = 0.0;
+	if (nullptr == m_feaExt)
+		return sim;
+
+//	if (1 == fnum)
+//	{
+//		sim = m_feaExt->getSimilarity(feature1, feature2);
+//		return sim;
+//	}
+
+	for(int i = 0; i < fnum; i++)
+	{
+		float sim_ = m_feaExt->getSimilarity(feature1, feature2);
+		sim = sim_ >  sim ? sim_ : sim;
+		feature2 += FSIZE;
+	}
+
+	return sim;
 }
